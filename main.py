@@ -54,6 +54,22 @@ def icon_for(name: str) -> str:
     return str(IMAGES_DIR / f"{name}.svg")
 
 
+def _pretty_label(uri: str) -> str:
+    """Render a URI the way VS Code's File → Open Recent menu shows it."""
+    decoded = urllib.parse.unquote(uri)
+    if decoded.startswith("file://"):
+        path = decoded[len("file://") :]
+        home = str(Path.home())
+        if path == home or path.startswith(home + "/"):
+            return "~" + path[len(home) :]
+        return path
+    if decoded.startswith("vscode-remote://"):
+        rest = decoded[len("vscode-remote://") :]
+        host, sep, path = rest.partition("/")
+        return f"[{host}] {sep}{path}" if sep else f"[{host}]"
+    return decoded
+
+
 @dataclass(frozen=True, slots=True)
 class Recent:
     uri: str
@@ -81,6 +97,7 @@ class Code:
         self.installed_path: Path | None = None
         self.global_state_db: Path | None = None
         self.storage_json: Path | None = None
+        self.workspace_storage_dir: Path | None = None
         self._cache: list[Recent] = []
         self._cache_key: tuple[tuple[Path, float], ...] | None = None
         self._locate()
@@ -97,6 +114,7 @@ class Code:
             self.installed_path = installed
             self.global_state_db = global_storage / "state.vscdb"
             self.storage_json = global_storage / "storage.json"
+            self.workspace_storage_dir = config_path / "User" / "workspaceStorage"
             logger.debug("located %s at %s with config %s", variant, installed, config_path)
             return
         logger.warning("Unable to find a VS Code installation or config directory")
@@ -122,7 +140,9 @@ class Code:
             return self._cache
 
         try:
-            recents = self.load_recents(self.global_state_db, self.storage_json)
+            recents = self.load_recents(
+                self.global_state_db, self.storage_json, self.workspace_storage_dir
+            )
         except Exception:
             logger.exception("failed to load recents")
             return list(self._cache)
@@ -133,7 +153,7 @@ class Code:
 
     def _cache_signature(self) -> tuple[tuple[Path, float], ...] | None:
         parts: list[tuple[Path, float]] = []
-        for path in (self.global_state_db, self.storage_json):
+        for path in (self.global_state_db, self.storage_json, self.workspace_storage_dir):
             if path is None or not path.exists():
                 continue
             try:
@@ -143,20 +163,39 @@ class Code:
         return tuple(parts) if parts else None
 
     @staticmethod
-    def load_recents(state_db: Path | None, storage_json: Path | None) -> list[Recent]:
-        """Load recents from any source VS Code may have written them to.
+    def load_recents(
+        state_db: Path | None,
+        storage_json: Path | None,
+        workspace_storage_dir: Path | None,
+    ) -> list[Recent]:
+        """Load recents from whichever source VS Code is actually using.
 
-        Order matches VS Code's own history precedence: legacy `state.vscdb`
-        key first (older builds), then `storage.json` (with both the legacy
-        `openedPathsList` and the modern `lastKnownMenubarData` cache).
+        Order:
+        1. Legacy `state.vscdb` key — authoritative on older VS Code builds.
+        2. Per-workspace `workspaceStorage/<hash>/workspace.json` — the most
+           accurate modern source: complete folder list, recency-sorted by
+           directory mtime. Augmented with file recents from the menubar
+           cache, since `workspaceStorage` only tracks folders/workspaces.
+        3. `storage.json` fallback — legacy `openedPathsList` or the
+           truncated `lastKnownMenubarData` menu cache (last 10 of each).
         """
         if state_db is not None and state_db.exists():
             recents = Code._load_state_db(state_db)
             if recents:
                 return recents
+
+        folders: list[Recent] = []
+        if workspace_storage_dir is not None and workspace_storage_dir.is_dir():
+            folders = Code._load_workspace_storage(workspace_storage_dir)
+
         if storage_json is not None and storage_json.exists():
-            return Code._load_storage_json(storage_json)
-        return []
+            from_storage = Code._load_storage_json(storage_json)
+            if not folders:
+                return from_storage
+            files = [r for r in from_storage if r.icon == "file"]
+            return folders + files
+
+        return folders
 
     @staticmethod
     def _load_state_db(path: Path) -> list[Recent]:
@@ -178,6 +217,40 @@ class Code:
         if legacy:
             return Code._parse_entries(legacy)
         return Code._parse_menubar(data)
+
+    @staticmethod
+    def _load_workspace_storage(directory: Path) -> list[Recent]:
+        """List recent folders/workspaces from per-workspace storage dirs.
+
+        VS Code creates `workspaceStorage/<hash>/workspace.json` for every
+        workspace it has ever opened. The hash dir's mtime tracks when that
+        workspace was last active — that's the recency signal we need.
+        Far better than `lastKnownMenubarData`, which is truncated to ~10
+        entries and only updated on menubar rebuilds.
+        """
+        items: list[tuple[float, Recent]] = []
+        for entry in directory.iterdir():
+            if not entry.is_dir():
+                continue
+            ws_json = entry / "workspace.json"
+            if not ws_json.is_file():
+                continue
+            try:
+                data = json.loads(ws_json.read_text(encoding="utf-8"))
+                mtime = entry.stat().st_mtime
+            except (OSError, json.JSONDecodeError):
+                continue
+            if folder := data.get("folder"):
+                uri, icon, option = folder, "folder", "--folder-uri"
+            elif config := data.get("configuration"):
+                uri, icon, option = config, "workspace", "--file-uri"
+            else:
+                continue
+            items.append(
+                (mtime, Recent(uri=uri, label=_pretty_label(uri), icon=icon, option=option))
+            )
+        items.sort(key=lambda pair: pair[0], reverse=True)
+        return [recent for _, recent in items]
 
     @staticmethod
     def _parse_entries(entries: Iterable[dict[str, Any]]) -> list[Recent]:

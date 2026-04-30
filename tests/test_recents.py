@@ -251,6 +251,69 @@ def test_parse_menubar_no_recent_submenu(code_module):
     assert code_module.Code._parse_menubar(storage) == []
 
 
+# --- _load_workspace_storage: per-workspace dirs sorted by mtime ---
+
+
+def _make_workspace_dir(root: Path, name: str, folder_uri: str, mtime: float) -> Path:
+    """Build one workspaceStorage/<hash>/ shaped like VS Code's layout."""
+    d = root / name
+    d.mkdir()
+    (d / "workspace.json").write_text(json.dumps({"folder": folder_uri}))
+    os.utime(d, (mtime, mtime))
+    return d
+
+
+def test_load_workspace_storage_sorts_by_mtime_descending(code_module, tmp_path):
+    _make_workspace_dir(tmp_path, "old", "file:///home/u/old-project", mtime=1000)
+    _make_workspace_dir(tmp_path, "newest", "file:///home/u/new-project", mtime=3000)
+    _make_workspace_dir(tmp_path, "middle", "file:///home/u/mid-project", mtime=2000)
+
+    recents = code_module.Code._load_workspace_storage(tmp_path)
+    assert [r.uri for r in recents] == [
+        "file:///home/u/new-project",
+        "file:///home/u/mid-project",
+        "file:///home/u/old-project",
+    ]
+
+
+def test_load_workspace_storage_handles_multiroot_workspace(code_module, tmp_path):
+    d = tmp_path / "ws"
+    d.mkdir()
+    (d / "workspace.json").write_text(
+        json.dumps({"configuration": "file:///home/u/proj.code-workspace"})
+    )
+    recents = code_module.Code._load_workspace_storage(tmp_path)
+    assert len(recents) == 1
+    assert recents[0].icon == "workspace"
+    assert recents[0].option == "--file-uri"
+    assert recents[0].uri == "file:///home/u/proj.code-workspace"
+
+
+def test_load_workspace_storage_skips_dirs_without_workspace_json(code_module, tmp_path):
+    (tmp_path / "stray").mkdir()
+    _make_workspace_dir(tmp_path, "ok", "file:///home/u/x", mtime=100)
+    recents = code_module.Code._load_workspace_storage(tmp_path)
+    assert [r.uri for r in recents] == ["file:///home/u/x"]
+
+
+def test_load_workspace_storage_label_is_home_relative(code_module, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", "/home/u")
+    _make_workspace_dir(tmp_path, "a", "file:///home/u/Code/proj", mtime=100)
+    recents = code_module.Code._load_workspace_storage(tmp_path)
+    assert recents[0].label == "~/Code/proj"
+
+
+def test_load_workspace_storage_label_for_remote_uri(code_module, tmp_path):
+    _make_workspace_dir(
+        tmp_path,
+        "remote",
+        "vscode-remote://ssh-remote%2Bhost.example/srv/app",
+        mtime=100,
+    )
+    recents = code_module.Code._load_workspace_storage(tmp_path)
+    assert recents[0].label == "[ssh-remote+host.example] /srv/app"
+
+
 # --- load_recents orchestrator: fallback chain ---
 
 
@@ -259,29 +322,63 @@ def test_load_recents_prefers_state_db_when_populated(code_module, tmp_path):
     _write_state_db(db, {"entries": [{"folderUri": "file:///from-db"}]})
     storage = tmp_path / "storage.json"
     storage.write_text(json.dumps(_menubar_storage(folders=["file:///from-storage"], files=[])))
-    recents = code_module.Code.load_recents(db, storage)
+    ws_dir = tmp_path / "ws"
+    ws_dir.mkdir()
+    _make_workspace_dir(ws_dir, "a", "file:///from-ws", mtime=100)
+    recents = code_module.Code.load_recents(db, storage, ws_dir)
     assert [r.uri for r in recents] == ["file:///from-db"]
 
 
+def test_load_recents_uses_workspace_storage_over_menubar(code_module, tmp_path):
+    """The fix: when both workspaceStorage and the truncated menubar exist,
+    the per-workspace dirs win because they're complete and properly sorted."""
+    storage = tmp_path / "storage.json"
+    storage.write_text(json.dumps(_menubar_storage(folders=["file:///from-menubar"], files=[])))
+    ws_dir = tmp_path / "ws"
+    ws_dir.mkdir()
+    _make_workspace_dir(ws_dir, "older", "file:///proj-older", mtime=100)
+    _make_workspace_dir(ws_dir, "newer", "file:///proj-newer", mtime=200)
+    recents = code_module.Code.load_recents(None, storage, ws_dir)
+    assert [r.uri for r in recents] == ["file:///proj-newer", "file:///proj-older"]
+
+
+def test_load_recents_merges_workspace_folders_with_menubar_files(code_module, tmp_path):
+    """workspaceStorage only tracks folders/workspaces, so file recents from
+    the menubar cache are appended after the sorted folder list."""
+    storage = tmp_path / "storage.json"
+    storage.write_text(
+        json.dumps(_menubar_storage(folders=["file:///stale"], files=["file:///some/file.py"]))
+    )
+    ws_dir = tmp_path / "ws"
+    ws_dir.mkdir()
+    _make_workspace_dir(ws_dir, "a", "file:///fresh-folder", mtime=100)
+    recents = code_module.Code.load_recents(None, storage, ws_dir)
+    assert [(r.icon, r.uri) for r in recents] == [
+        ("folder", "file:///fresh-folder"),
+        ("file", "file:///some/file.py"),
+    ]
+
+
 def test_load_recents_falls_back_to_storage_when_db_empty(code_module, tmp_path):
-    """The exact failure mode hit on modern VS Code: DB exists but empty key."""
+    """The exact failure mode hit on modern VS Code: DB exists but empty key.
+    Without workspaceStorage we still fall back to the menubar cache."""
     db = tmp_path / "state.vscdb"
     _write_state_db(db, recents=None)
     storage = tmp_path / "storage.json"
     storage.write_text(json.dumps(_menubar_storage(folders=["file:///from-menubar"], files=[])))
-    recents = code_module.Code.load_recents(db, storage)
+    recents = code_module.Code.load_recents(db, storage, None)
     assert [r.uri for r in recents] == ["file:///from-menubar"]
 
 
 def test_load_recents_no_sources_returns_empty(code_module, tmp_path):
-    assert code_module.Code.load_recents(None, None) == []
-    assert code_module.Code.load_recents(tmp_path / "missing.vscdb", None) == []
+    assert code_module.Code.load_recents(None, None, None) == []
+    assert code_module.Code.load_recents(tmp_path / "missing.vscdb", None, None) == []
 
 
 def test_load_recents_state_db_missing_storage_only(code_module, tmp_path):
     storage = tmp_path / "storage.json"
     storage.write_text(json.dumps(_menubar_storage(folders=["file:///only"], files=[])))
-    recents = code_module.Code.load_recents(None, storage)
+    recents = code_module.Code.load_recents(None, storage, None)
     assert [r.uri for r in recents] == ["file:///only"]
 
 
@@ -295,6 +392,7 @@ def code_instance(code_module):
     code.installed_path = Path("/usr/bin/code")
     code.global_state_db = None
     code.storage_json = None
+    code.workspace_storage_dir = None
     code._cache = []
     code._cache_key = None
     return code
