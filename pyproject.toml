@@ -1,28 +1,78 @@
 [project]
-name = "ulauncher-vscode-recent"
-version = "0.1.0"
-description = "Open recent VS Code folders and files using Ulauncher"
-authors = [
-    "Mihir Chaturvedi <plibither8@gmail.com>"
-]
-license = "MIT"
+name = "ulauncher-vscode-lookup"
+version = "0.2.0"
+description = "Fuzzy-search and open recent VS Code folders, files and workspaces from Ulauncher"
 readme = "README.md"
-python = "^3.6"
-homepage = "https://github.com/plibither8/ulauncher-vscode-recent"
-repository = "https://github.com/plibither8/ulauncher-vscode-recent"
-documentation = "https://github.com/plibither8/ulauncher-vscode-recent"
-
-keywords = ["ulauncher", "extension", "code", "vscode"]
-
+license = { text = "MIT" }
+requires-python = ">=3.12"
+authors = [
+    { name = "KonScanner" },
+]
+maintainers = [
+    { name = "KonScanner" },
+]
+keywords = ["ulauncher", "extension", "code", "vscode", "vscodium"]
 classifiers = [
-    "Topic :: Desktop Environment"
+    "Topic :: Desktop Environment",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "rapidfuzz>=3.0",
 ]
 
-# Requirements
-[dev-dependencies]
-black = { version = "^18.3-alpha.0", python = "^3.6" }
+[project.urls]
+Homepage = "https://github.com/KonScanner/ulauncher-vscode-lookup"
+Repository = "https://github.com/KonScanner/ulauncher-vscode-lookup"
+Issues = "https://github.com/KonScanner/ulauncher-vscode-lookup/issues"
+Upstream = "https://github.com/plibither8/ulauncher-vscode-recent"
 
-[tool.black]
-line-length = 88
-target_version = ['py36']
-include = '\.pyi?$'
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.5",
+    "ty>=0.0.1a1",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "B",     # flake8-bugbear
+    "UP",    # pyupgrade
+    "SIM",   # flake8-simplify
+    "RUF",   # ruff-specific rules
+    "PL",    # pylint
+    "PTH",   # flake8-use-pathlib
+    "S",     # flake8-bandit
+    "C4",    # flake8-comprehensions
+    "ARG",   # flake8-unused-arguments
+    "TRY",   # tryceratops
+    "RET",   # flake8-return
+    "PIE",   # flake8-pie
+]
+ignore = [
+    "PLR0913",  # too many arguments
+    "TRY003",   # long messages outside exception class
+    "S101",     # use of assert
+]
+
+[tool.ruff.lint.per-file-ignores]
+"main.py" = [
+    "PLR2004",  # magic-number comparisons (thresholds are fine inline)
+]
+
+[tool.ty.src]
+include = ["main.py"]
+
+[tool.ty.rules]
+unresolved-import = "ignore"
+invalid-parameter-default = "ignore"

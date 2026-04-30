@@ -1,245 +1,351 @@
-import os
-import os.path
+"""Ulauncher extension: open recently-used VS Code folders, files and workspaces."""
+from __future__ import annotations
+
 import json
 import logging
-import pathlib
+import os
+import shutil
 import sqlite3
-import urllib
 import subprocess
-from ulauncher.api.client.Extension import Extension
+import urllib.parse
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Final
+
+from rapidfuzz import fuzz, process, utils
 from ulauncher.api.client.EventListener import EventListener
+from ulauncher.api.client.Extension import Extension
+from ulauncher.api.shared.action.ExtensionCustomAction import ExtensionCustomAction
+from ulauncher.api.shared.action.HideWindowAction import HideWindowAction
+from ulauncher.api.shared.action.RenderResultListAction import RenderResultListAction
 from ulauncher.api.shared.event import (
-	KeywordQueryEvent,
-	ItemEnterEvent,
-	PreferencesEvent,
-	PreferencesUpdateEvent,
+    ItemEnterEvent,
+    KeywordQueryEvent,
+    PreferencesEvent,
+    PreferencesUpdateEvent,
 )
 from ulauncher.api.shared.item.ExtensionResultItem import ExtensionResultItem
 from ulauncher.api.shared.item.ExtensionSmallResultItem import ExtensionSmallResultItem
-from ulauncher.api.shared.action.RenderResultListAction import RenderResultListAction
-from ulauncher.api.shared.action.HideWindowAction import HideWindowAction
-from ulauncher.api.shared.action.ExtensionCustomAction import ExtensionCustomAction
-from fuzzywuzzy import process, fuzz
 
 logger = logging.getLogger(__name__)
 
+EXTENSION_DIR: Final[Path] = Path(__file__).parent.resolve()
+IMAGES_DIR: Final[Path] = EXTENSION_DIR / "images"
 
-class Utils:
-	@staticmethod
-	def get_path(filename, from_home=False):
-		base_dir = pathlib.Path.home() if from_home else pathlib.Path(
-			__file__).parent.absolute()
-		return os.path.join(base_dir, filename)
+SEARCH_PATHS: Final[tuple[Path, ...]] = (
+    Path("/usr/bin"),
+    Path("/usr/local/bin"),
+    Path("/bin"),
+    Path("/snap/bin"),
+    Path.home() / ".local" / "bin",
+)
+VARIANTS: Final[tuple[str, ...]] = ("Code", "VSCodium", "Code - OSS")
+
+LABEL_MATCH_THRESHOLD: Final[int] = 60
+URI_MATCH_THRESHOLD: Final[int] = 60
+MAX_RESULTS: Final[int] = 20
+RECENTS_KEY: Final[str] = "history.recentlyOpenedPathsList"
+
+
+def icon_for(name: str) -> str:
+    return str(IMAGES_DIR / f"{name}.svg")
+
+
+@dataclass(frozen=True, slots=True)
+class Recent:
+    uri: str
+    label: str
+    icon: str
+    option: str
+
+    @property
+    def display_name(self) -> str:
+        return urllib.parse.unquote(self.label)
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "uri": self.uri,
+            "label": self.label,
+            "icon": self.icon,
+            "option": self.option,
+        }
 
 
 class Code:
-	path_dirs = ("/usr/bin", "/bin", "/snap/bin")
-	variants = ("Code", "VSCodium")
+    """Locate a VS Code installation and read its recent-projects list."""
 
-	def __init__(self):
-		self.installed_path = None
-		self.config_path = None
-		self.global_state_db = None
-		self.storage_json = None
+    def __init__(self) -> None:
+        self.installed_path: Path | None = None
+        self.global_state_db: Path | None = None
+        self.storage_json: Path | None = None
+        self._cache: list[Recent] = []
+        self._cache_key: tuple[Path, float] | None = None
+        self._locate()
 
-		logger.debug('locating installation and config directories')
-		for path in (pathlib.Path(path_dir) for path_dir in Code.path_dirs):
-			for variant in Code.variants:
-				installed_path = path / variant.lower()
-				config_path = pathlib.Path.home() / ".config" / variant
-				logger.debug('evaluating installation dir %s and config dir %s',
-				             installed_path, config_path)
-				if installed_path.exists() and config_path.exists() and (config_path / "User" / "globalStorage" / "storage.json").exists():
-					logger.debug('found installation dir %s and config dir %s',
-					             installed_path, config_path)
-					self.installed_path = installed_path
-					self.config_path = config_path
-					self.global_state_db = config_path / 'User' / 'globalStorage' / 'state.vscdb'
-					self.storage_json = config_path / 'User' / 'globalStorage' / 'storage.json'
-					return
+    def _locate(self) -> None:
+        for variant in VARIANTS:
+            config_path = Path.home() / ".config" / variant
+            global_storage = config_path / "User" / "globalStorage"
+            if not global_storage.is_dir():
+                continue
+            installed = self._find_executable(variant)
+            if installed is None:
+                continue
+            self.installed_path = installed
+            self.global_state_db = global_storage / "state.vscdb"
+            self.storage_json = global_storage / "storage.json"
+            logger.debug(
+                "located %s at %s with config %s", variant, installed, config_path
+            )
+            return
+        logger.warning("Unable to find a VS Code installation or config directory")
 
-		logger.warning('Unable to find VS Code installation and config directory')
+    @staticmethod
+    def _find_executable(variant: str) -> Path | None:
+        binary = variant.lower()
+        for path_dir in SEARCH_PATHS:
+            candidate = path_dir / binary
+            if candidate.exists():
+                return candidate
+        on_path = shutil.which(binary)
+        return Path(on_path) if on_path else None
 
-	def is_installed(self):
-		return bool(self.installed_path)
+    def is_installed(self) -> bool:
+        return self.installed_path is not None
 
-	def get_recents(self):
+    def get_recents(self) -> list[Recent]:
+        source = self._active_source()
+        if source is None:
+            return []
+        try:
+            mtime = source.stat().st_mtime
+        except OSError:
+            return list(self._cache)
 
-		# Current
-		if self.global_state_db.exists():
-			logger.debug('getting recents from global state database')
-			try:
-				return self.get_recents_global_state()
-			except Exception as e:
-				logger.error('getting recents from global state database failed', e)
-				if not self.storage_json.exists():
-					raise e
+        cache_key = (source, mtime)
+        if self._cache_key == cache_key and self._cache:
+            return self._cache
 
-		# Legacy
-		if self.storage_json.exists():
-			logger.debug('getting recents from storage.json (legacy)')
-			return self.get_recents_legacy()
+        try:
+            recents = self._load(source)
+        except Exception:
+            logger.exception("failed to load recents from %s", source)
+            return list(self._cache)
 
-	def get_recents_global_state(self):
-		logger.debug('connecting to global state database %s', self.global_state_db)
-		con = sqlite3.connect(self.global_state_db)
-		cur = con.cursor()
-		cur.execute(
-			'SELECT value FROM ItemTable WHERE key = "history.recentlyOpenedPathsList"')
-		json_code, = cur.fetchone()
-		paths_list = json.loads(json_code)
-		entries = paths_list['entries']
-		logger.debug('found %d entries in global state database', len(entries))
-		return self.parse_entry_paths(entries)
+        self._cache = recents
+        self._cache_key = cache_key
+        return recents
 
-	def get_recents_legacy(self):
-		"""
-		For Visual Studio Code Pre versions before 1.64
-		:uri https://code.visualstudio.com/updates/v1_64
-		"""
-		logger.debug('loading storage.json')
-		storage = json.load(self.storage_json.open("r"))
-		entries = storage["openedPathsList"]["entries"]
-		logger.debug('found %d entries in storage.json', len(entries))
-		return self.parse_entry_paths(entries)
+    def _active_source(self) -> Path | None:
+        if self.global_state_db and self.global_state_db.exists():
+            return self.global_state_db
+        if self.storage_json and self.storage_json.exists():
+            return self.storage_json
+        return None
 
-	@staticmethod
-	def parse_entry_paths(entries):
-		recents = []
-		for path in entries:
-			if "folderUri" in path:
-				uri = path["folderUri"]
-				icon = "folder"
-				option = "--folder-uri"
-			elif "fileUri" in path:
-				uri = path["fileUri"]
-				icon = "file"
-				option = "--file-uri"
-			elif "workspace" in path:
-				uri = path["workspace"]["configPath"]
-				icon = "workspace"
-				option = "--file-uri"
-			else:
-				logger.warning('entry not recognized: %s', path)
-				continue
+    def _load(self, source: Path) -> list[Recent]:
+        if source.suffix == ".vscdb":
+            return self._load_state_db(source)
+        return self._load_storage_json(source)
 
-			label = path["label"] if "label" in path else uri.split("/")[-1]
-			recents.append({
-				"uri":    uri,
-				"label":  label,
-				"icon":   icon,
-				"option": option,
-			})
-		return recents
+    @staticmethod
+    def _load_state_db(path: Path) -> list[Recent]:
+        uri = f"file:{urllib.parse.quote(str(path))}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as con:
+            row = con.execute(
+                "SELECT value FROM ItemTable WHERE key = ?", (RECENTS_KEY,)
+            ).fetchone()
+        if not row:
+            return []
+        data = json.loads(row[0])
+        return Code._parse_entries(data.get("entries", []))
 
-	def open_vscode(self, recent, excluded_env_vars):
-		if not self.is_installed():
-			return
-		# Get the current environment variables
-		current_env = os.environ.copy()
+    @staticmethod
+    def _load_storage_json(path: Path) -> list[Recent]:
+        with path.open("r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        entries = data.get("openedPathsList", {}).get("entries", [])
+        return Code._parse_entries(entries)
 
-		# Remove the environment variables that we don't want to pass to the new process if any
-		if excluded_env_vars:
-			for env_var in excluded_env_vars.split(','):
-				env_to_exclude = env_var.strip()
-				if env_to_exclude in current_env:
-					del current_env[env_to_exclude]
+    @staticmethod
+    def _parse_entries(entries: Iterable[dict[str, Any]]) -> list[Recent]:
+        recents: list[Recent] = []
+        for entry in entries:
+            match entry:
+                case {"folderUri": str(uri)}:
+                    icon, option = "folder", "--folder-uri"
+                case {"fileUri": str(uri)}:
+                    icon, option = "file", "--file-uri"
+                case {"workspace": {"configPath": str(uri)}}:
+                    icon, option = "workspace", "--file-uri"
+                case _:
+                    logger.warning("unrecognized entry: %s", entry)
+                    continue
+            label = entry.get("label") or uri.rsplit("/", 1)[-1]
+            recents.append(Recent(uri=uri, label=label, icon=icon, option=option))
+        return recents
 
-		# Start the new process with the modified environment
-		subprocess.run([self.installed_path, recent['option'], recent['uri']], env=current_env)
+    def open_vscode(
+        self, recent: dict[str, str], excluded_env_vars: str | None
+    ) -> None:
+        if self.installed_path is None:
+            logger.error("cannot open VS Code: no installation located")
+            return
+        env = os.environ.copy()
+        if excluded_env_vars:
+            for var in (v.strip() for v in excluded_env_vars.split(",")):
+                if var:
+                    env.pop(var, None)
+
+        cmd: list[str] = [str(self.installed_path)]
+        if option := recent.get("option"):
+            cmd.append(option)
+        uri = recent.get("uri", "").strip()
+        if not uri:
+            logger.error("cannot open VS Code: empty URI")
+            return
+        cmd.append(uri)
+
+        try:
+            subprocess.Popen(  # noqa: S603 - command is a fixed binary path + sanitized args
+                cmd,
+                env=env,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            logger.exception("failed to launch VS Code: %s", cmd)
 
 
 class CodeExtension(Extension):
-	keyword = None
-	excluded_env_vars = None
-	code = None
+    def __init__(self) -> None:
+        super().__init__()
+        self.keyword: str | None = None
+        self.excluded_env_vars: str | None = None
+        self.code = Code()
+        self.subscribe(KeywordQueryEvent, KeywordQueryEventListener())
+        self.subscribe(ItemEnterEvent, ItemEnterEventListener())
+        self.subscribe(PreferencesEvent, PreferencesEventListener())
+        self.subscribe(PreferencesUpdateEvent, PreferencesUpdateEventListener())
 
-	def __init__(self):
-		super(CodeExtension, self).__init__()
-		self.subscribe(KeywordQueryEvent, KeywordQueryEventListener())
-		self.subscribe(ItemEnterEvent, ItemEnterEventListener())
-		self.subscribe(PreferencesEvent, PreferencesEventListener())
-		self.subscribe(PreferencesUpdateEvent, PreferencesUpdateEventListener())
-		self.code = Code()
+    def get_ext_result_items(self, query: str) -> list[ExtensionResultItem]:
+        query_raw = (query or "").strip()
+        recents = self.code.get_recents()
+        items: list[ExtensionResultItem] = []
 
-	def get_ext_result_items(self, query):
-		query_raw = query
-		query = query.lower() if query else ""
-		recents = self.code.get_recents()
-		items = []
-		data = []
-		label_matches = process.extract(query, choices=map(
-			lambda c: c["label"], recents), limit=20, scorer=fuzz.partial_ratio)
-		uri_matches = process.extract(query, choices=map(
-			lambda c: c["uri"], recents), limit=20, scorer=fuzz.partial_ratio)
-		for match in label_matches:
-			recent = next((c for c in recents if c["label"] == match[0]), None)
-			if (recent is not None and match[1] > 95):
-				data.append(recent)
-		for match in uri_matches:
-			recent = next((c for c in recents if c["uri"] == match[0]), None)
-			existing = next((c for c in data if c["uri"] == recent["uri"]), None)
-			if (recent is not None and existing is None):
-				data.append(recent)	
-		if query_raw.strip() != "":
-			items.append(
-				ExtensionSmallResultItem(
-					icon=Utils.get_path(f"images/icon.svg"),
-					name=query_raw,
-					on_enter=ExtensionCustomAction({'option': '', 'uri':query_raw}),
-				)
-			)
-		for recent in data[:20]:
-			items.append(
-				ExtensionSmallResultItem(
-					icon=Utils.get_path(f"images/{recent['icon']}.svg"),
-					name=urllib.parse.unquote(recent["label"]),
-					on_enter=ExtensionCustomAction(recent),
-				)
-			)
-		return items
+        if query_raw:
+            items.append(
+                ExtensionSmallResultItem(
+                    icon=icon_for("icon"),
+                    name=query_raw,
+                    on_enter=ExtensionCustomAction(
+                        {"option": "", "uri": query_raw, "label": query_raw, "icon": "file"}
+                    ),
+                )
+            )
+
+        if not recents:
+            return items
+
+        if not query_raw:
+            for recent in recents[:MAX_RESULTS]:
+                items.append(self._make_result(recent))
+            return items
+
+        items.extend(self._fuzzy_match(query_raw, recents))
+        return items
+
+    def _fuzzy_match(self, query: str, recents: list[Recent]) -> list[ExtensionResultItem]:
+        label_choices = {i: r.label for i, r in enumerate(recents)}
+        uri_choices = {i: r.uri for i, r in enumerate(recents)}
+        label_matches = process.extract(
+            query,
+            label_choices,
+            scorer=fuzz.partial_ratio,
+            processor=utils.default_process,
+            limit=MAX_RESULTS,
+        )
+        uri_matches = process.extract(
+            query,
+            uri_choices,
+            scorer=fuzz.partial_ratio,
+            processor=utils.default_process,
+            limit=MAX_RESULTS,
+        )
+
+        seen: set[int] = set()
+        results: list[ExtensionResultItem] = []
+        for matches, threshold in (
+            (label_matches, LABEL_MATCH_THRESHOLD),
+            (uri_matches, URI_MATCH_THRESHOLD),
+        ):
+            for _, score, idx in matches:
+                if score < threshold or idx in seen:
+                    continue
+                seen.add(idx)
+                results.append(self._make_result(recents[idx]))
+                if len(results) >= MAX_RESULTS:
+                    return results
+        return results
+
+    @staticmethod
+    def _make_result(recent: Recent) -> ExtensionSmallResultItem:
+        return ExtensionSmallResultItem(
+            icon=icon_for(recent.icon),
+            name=recent.display_name,
+            on_enter=ExtensionCustomAction(recent.to_dict()),
+        )
 
 
 class KeywordQueryEventListener(EventListener):
-	def on_event(self, event, extension):
-		items = []
-
-		if not extension.code.is_installed():
-			items.append(
-				ExtensionResultItem(
-					icon=Utils.get_path("images/icon.svg"),
-					name="No VS Code?",
-					description="Can't find the VS Code's `code` command in your system :(",
-					highlightable=False,
-					on_enter=HideWindowAction(),
-				)
-			)
-			return RenderResultListAction(items)
-
-		argument = event.get_argument() or ""
-		items.extend(extension.get_ext_result_items(argument))
-		return RenderResultListAction(items)
+    def on_event(
+        self, event: KeywordQueryEvent, extension: CodeExtension
+    ) -> RenderResultListAction:
+        if not extension.code.is_installed():
+            return RenderResultListAction(
+                [
+                    ExtensionResultItem(
+                        icon=icon_for("icon"),
+                        name="No VS Code?",
+                        description=(
+                            "Can't find a VS Code, VSCodium, or Code - OSS installation."
+                        ),
+                        highlightable=False,
+                        on_enter=HideWindowAction(),
+                    )
+                ]
+            )
+        argument = event.get_argument() or ""
+        return RenderResultListAction(extension.get_ext_result_items(argument))
 
 
 class ItemEnterEventListener(EventListener):
-	def on_event(self, event, extension):
-		recent = event.get_data()
-		extension.code.open_vscode(recent, extension.excluded_env_vars)
+    def on_event(self, event: ItemEnterEvent, extension: CodeExtension) -> None:
+        recent = event.get_data()
+        if not isinstance(recent, dict):
+            logger.error("unexpected event payload: %r", recent)
+            return
+        extension.code.open_vscode(recent, extension.excluded_env_vars)
 
 
 class PreferencesEventListener(EventListener):
-	def on_event(self, event, extension):
-		extension.keyword = event.preferences["code_kw"]
-		extension.excluded_env_vars = event.preferences['excluded_env_vars']
+    def on_event(self, event: PreferencesEvent, extension: CodeExtension) -> None:
+        prefs = event.preferences or {}
+        extension.keyword = prefs.get("code_kw")
+        extension.excluded_env_vars = prefs.get("excluded_env_vars")
 
 
 class PreferencesUpdateEventListener(EventListener):
-	def on_event(self, event, extension):
-		if event.id == "code_kw":
-			extension.keyword = event.new_value
-		if event.id == "excluded_env_vars":
-			extension.excluded_env_vars = event.new_value
+    def on_event(
+        self, event: PreferencesUpdateEvent, extension: CodeExtension
+    ) -> None:
+        if event.id == "code_kw":
+            extension.keyword = event.new_value
+        elif event.id == "excluded_env_vars":
+            extension.excluded_env_vars = event.new_value
 
 
 if __name__ == "__main__":
-	CodeExtension().run()
+    CodeExtension().run()

@@ -1,1 +1,14 @@
 .vscode
+
+*.egg-info/**
+.idea/**
+.claude/**
+venv/**
+.venv/**
+build/**
+dist/**
+**/__pycache__/**
+*/static/*
+*.tox
+.vscode/**
+.ruff_cache/
