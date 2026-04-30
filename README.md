@@ -76,6 +76,20 @@ make ruff        # lint
 make typecheck   # static type-check with ty
 ```
 
+## Contributing
+
+Direct pushes to `main` are reserved for the maintainer ([@KonScanner](https://github.com/KonScanner)). Everyone else: please fork the repo and open a pull request.
+
+Before opening a PR:
+
+```bash
+make format
+make typecheck
+make test
+```
+
+PRs follow the [pull request template](.github/PULL_REQUEST_TEMPLATE.md) — fill in the relevant sections and tick the checklist.
+
 ## Publishing your fork
 
 This repo is already in publishable shape. To cut a release:
