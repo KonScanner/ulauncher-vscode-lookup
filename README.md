@@ -4,7 +4,7 @@
 
 A modernized fork of [`plibither8/ulauncher-vscode-recent`](https://github.com/plibither8/ulauncher-vscode-recent), updated for Python 3.12+ with `rapidfuzz`, type hints, mtime-cached recents, broader install-path detection, and a stack of bug fixes.
 
-![preview](images/icon.svg)
+<p align="center"><img src="images/icon.svg" alt="preview" width="120"></p>
 
 ## What's different from upstream
 
