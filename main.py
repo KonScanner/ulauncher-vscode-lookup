@@ -1,4 +1,5 @@
 """Ulauncher extension: open recently-used VS Code folders, files and workspaces."""
+
 from __future__ import annotations
 
 import json
@@ -46,6 +47,7 @@ LABEL_MATCH_THRESHOLD: Final[int] = 60
 URI_MATCH_THRESHOLD: Final[int] = 60
 MAX_RESULTS: Final[int] = 20
 RECENTS_KEY: Final[str] = "history.recentlyOpenedPathsList"
+RECENT_MENU_ID: Final[str] = "submenuitem.MenubarRecentMenu"
 
 
 def icon_for(name: str) -> str:
@@ -80,7 +82,7 @@ class Code:
         self.global_state_db: Path | None = None
         self.storage_json: Path | None = None
         self._cache: list[Recent] = []
-        self._cache_key: tuple[Path, float] | None = None
+        self._cache_key: tuple[tuple[Path, float], ...] | None = None
         self._locate()
 
     def _locate(self) -> None:
@@ -95,9 +97,7 @@ class Code:
             self.installed_path = installed
             self.global_state_db = global_storage / "state.vscdb"
             self.storage_json = global_storage / "storage.json"
-            logger.debug(
-                "located %s at %s with config %s", variant, installed, config_path
-            )
+            logger.debug("located %s at %s with config %s", variant, installed, config_path)
             return
         logger.warning("Unable to find a VS Code installation or config directory")
 
@@ -115,39 +115,48 @@ class Code:
         return self.installed_path is not None
 
     def get_recents(self) -> list[Recent]:
-        source = self._active_source()
-        if source is None:
+        cache_key = self._cache_signature()
+        if cache_key is None:
             return []
-        try:
-            mtime = source.stat().st_mtime
-        except OSError:
-            return list(self._cache)
-
-        cache_key = (source, mtime)
         if self._cache_key == cache_key and self._cache:
             return self._cache
 
         try:
-            recents = self._load(source)
+            recents = self.load_recents(self.global_state_db, self.storage_json)
         except Exception:
-            logger.exception("failed to load recents from %s", source)
+            logger.exception("failed to load recents")
             return list(self._cache)
 
         self._cache = recents
         self._cache_key = cache_key
         return recents
 
-    def _active_source(self) -> Path | None:
-        if self.global_state_db and self.global_state_db.exists():
-            return self.global_state_db
-        if self.storage_json and self.storage_json.exists():
-            return self.storage_json
-        return None
+    def _cache_signature(self) -> tuple[tuple[Path, float], ...] | None:
+        parts: list[tuple[Path, float]] = []
+        for path in (self.global_state_db, self.storage_json):
+            if path is None or not path.exists():
+                continue
+            try:
+                parts.append((path, path.stat().st_mtime))
+            except OSError:
+                continue
+        return tuple(parts) if parts else None
 
-    def _load(self, source: Path) -> list[Recent]:
-        if source.suffix == ".vscdb":
-            return self._load_state_db(source)
-        return self._load_storage_json(source)
+    @staticmethod
+    def load_recents(state_db: Path | None, storage_json: Path | None) -> list[Recent]:
+        """Load recents from any source VS Code may have written them to.
+
+        Order matches VS Code's own history precedence: legacy `state.vscdb`
+        key first (older builds), then `storage.json` (with both the legacy
+        `openedPathsList` and the modern `lastKnownMenubarData` cache).
+        """
+        if state_db is not None and state_db.exists():
+            recents = Code._load_state_db(state_db)
+            if recents:
+                return recents
+        if storage_json is not None and storage_json.exists():
+            return Code._load_storage_json(storage_json)
+        return []
 
     @staticmethod
     def _load_state_db(path: Path) -> list[Recent]:
@@ -165,8 +174,10 @@ class Code:
     def _load_storage_json(path: Path) -> list[Recent]:
         with path.open("r", encoding="utf-8") as fp:
             data = json.load(fp)
-        entries = data.get("openedPathsList", {}).get("entries", [])
-        return Code._parse_entries(entries)
+        legacy = data.get("openedPathsList", {}).get("entries", [])
+        if legacy:
+            return Code._parse_entries(legacy)
+        return Code._parse_menubar(data)
 
     @staticmethod
     def _parse_entries(entries: Iterable[dict[str, Any]]) -> list[Recent]:
@@ -186,9 +197,46 @@ class Code:
             recents.append(Recent(uri=uri, label=label, icon=icon, option=option))
         return recents
 
-    def open_vscode(
-        self, recent: dict[str, str], excluded_env_vars: str | None
-    ) -> None:
+    @staticmethod
+    def _parse_menubar(storage: dict[str, Any]) -> list[Recent]:
+        """Read recents from VS Code's cached File → Open Recent menu.
+
+        Modern VS Code (≈2025+) no longer writes `history.recentlyOpenedPathsList`
+        but keeps a recents-ordered cache here so the menu can render before
+        the workbench finishes loading.
+        """
+        file_menu = (
+            storage.get("lastKnownMenubarData", {})
+            .get("menus", {})
+            .get("File", {})
+            .get("items", [])
+        )
+        submenu: list[dict[str, Any]] = []
+        for item in file_menu:
+            if item.get("id") == RECENT_MENU_ID:
+                submenu = item.get("submenu", {}).get("items", [])
+                break
+
+        recents: list[Recent] = []
+        for item in submenu:
+            match item.get("id"):
+                case "openRecentFolder":
+                    icon, option = "folder", "--folder-uri"
+                case "openRecentFile":
+                    icon, option = "file", "--file-uri"
+                case "openRecentWorkspace":
+                    icon, option = "workspace", "--file-uri"
+                case _:
+                    continue
+            uri_obj = item.get("uri") or {}
+            uri = uri_obj.get("external") or uri_obj.get("path")
+            if not uri:
+                continue
+            label = item.get("label") or uri.rsplit("/", 1)[-1]
+            recents.append(Recent(uri=uri, label=label, icon=icon, option=option))
+        return recents
+
+    def open_vscode(self, recent: dict[str, str], excluded_env_vars: str | None) -> None:
         if self.installed_path is None:
             logger.error("cannot open VS Code: no installation located")
             return
@@ -309,9 +357,7 @@ class KeywordQueryEventListener(EventListener):
                     ExtensionResultItem(
                         icon=icon_for("icon"),
                         name="No VS Code?",
-                        description=(
-                            "Can't find a VS Code, VSCodium, or Code - OSS installation."
-                        ),
+                        description=("Can't find a VS Code, VSCodium, or Code - OSS installation."),
                         highlightable=False,
                         on_enter=HideWindowAction(),
                     )
@@ -338,9 +384,7 @@ class PreferencesEventListener(EventListener):
 
 
 class PreferencesUpdateEventListener(EventListener):
-    def on_event(
-        self, event: PreferencesUpdateEvent, extension: CodeExtension
-    ) -> None:
+    def on_event(self, event: PreferencesUpdateEvent, extension: CodeExtension) -> None:
         if event.id == "code_kw":
             extension.keyword = event.new_value
         elif event.id == "excluded_env_vars":

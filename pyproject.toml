@@ -1,6 +1,6 @@
 [project]
 name = "ulauncher-vscode-lookup"
-version = "0.2.0"
+version = "1.0.0"
 description = "Fuzzy-search and open recent VS Code folders, files and workspaces from Ulauncher"
 readme = "README.md"
 license = { text = "MIT" }
@@ -33,6 +33,7 @@ Upstream = "https://github.com/plibither8/ulauncher-vscode-recent"
 dev = [
     "ruff>=0.5",
     "ty>=0.0.1a1",
+    "pytest>=8",
 ]
 
 [tool.ruff]

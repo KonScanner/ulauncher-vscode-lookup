@@ -81,11 +81,11 @@ make typecheck   # static type-check with ty
 This repo is already in publishable shape. To cut a release:
 
 1. Bump `version` in [`pyproject.toml`](pyproject.toml).
-2. Tag the commit: `git tag v0.2.0 && git push --tags`.
+2. Tag the commit: `git tag v1.0.0 && git push --tags`.
 3. (Optional) Update [`versions.json`](versions.json) to point at the tag instead of `main` so Ulauncher pins to a specific revision:
 
    ```json
-   [{ "required_api_version": "^2.0.0", "commit": "v0.2.0" }]
+   [{ "required_api_version": "^2.0.0", "commit": "v1.0.0" }]
    ```
 4. Anyone can then install via the Ulauncher UI using the repo URL.
 
