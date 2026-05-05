@@ -41,7 +41,12 @@ SEARCH_PATHS: Final[tuple[Path, ...]] = (
     Path("/snap/bin"),
     Path.home() / ".local" / "bin",
 )
-VARIANTS: Final[tuple[str, ...]] = ("Code", "VSCodium", "Code - OSS")
+VARIANTS: Final[tuple[tuple[str, str], ...]] = (
+    ("Code", "code"),
+    ("Code - Insiders", "code-insiders"),
+    ("VSCodium", "codium"),
+    ("Code - OSS", "code-oss"),
+)
 
 LABEL_MATCH_THRESHOLD: Final[int] = 60
 URI_MATCH_THRESHOLD: Final[int] = 60
@@ -103,12 +108,12 @@ class Code:
         self._locate()
 
     def _locate(self) -> None:
-        for variant in VARIANTS:
+        for variant, binary in VARIANTS:
             config_path = Path.home() / ".config" / variant
             global_storage = config_path / "User" / "globalStorage"
             if not global_storage.is_dir():
                 continue
-            installed = self._find_executable(variant)
+            installed = self._find_executable(binary)
             if installed is None:
                 continue
             self.installed_path = installed
@@ -120,8 +125,7 @@ class Code:
         logger.warning("Unable to find a VS Code installation or config directory")
 
     @staticmethod
-    def _find_executable(variant: str) -> Path | None:
-        binary = variant.lower()
+    def _find_executable(binary: str) -> Path | None:
         for path_dir in SEARCH_PATHS:
             candidate = path_dir / binary
             if candidate.exists():
