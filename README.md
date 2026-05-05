@@ -14,7 +14,7 @@ A modernized fork of [`plibither8/ulauncher-vscode-recent`](https://github.com/p
 | Fuzzy lib | `fuzzywuzzy` (slow, GPL) | **`rapidfuzz`** (fast, MIT, C++) |
 | Recents source | `storage.json` only | `state.vscdb` **and** `storage.json` |
 | Install paths | `/usr/bin`, `/bin`, `/snap/bin` | + `/usr/local/bin`, `~/.local/bin`, `$PATH` fallback |
-| Variants | `Code`, `VSCodium` | + `Code - OSS` |
+| Variants | `Code`, `VSCodium` | + `Code - OSS`, `Code - Insiders` |
 | `subprocess` | blocking `run` | non-blocking `Popen(start_new_session=True)` |
 | Caching | re-reads file every keystroke | mtime-keyed in-memory cache |
 | Types / linting | none | `ty` + `ruff`, full type hints, `dataclasses`, `match`/`case` |
