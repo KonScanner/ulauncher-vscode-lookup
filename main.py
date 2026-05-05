@@ -49,6 +49,18 @@ MAX_RESULTS: Final[int] = 20
 RECENTS_KEY: Final[str] = "history.recentlyOpenedPathsList"
 RECENT_MENU_ID: Final[str] = "submenuitem.MenubarRecentMenu"
 
+# kind → CLI flag VS Code expects for that URI. Icon name == kind.
+_OPTION_BY_KIND: Final[dict[str, str]] = {
+    "folder": "--folder-uri",
+    "file": "--file-uri",
+    "workspace": "--file-uri",
+}
+_MENU_ID_TO_KIND: Final[dict[str, str]] = {
+    "openRecentFolder": "folder",
+    "openRecentFile": "file",
+    "openRecentWorkspace": "workspace",
+}
+
 
 def icon_for(name: str) -> str:
     return str(IMAGES_DIR / f"{name}.svg")
@@ -88,6 +100,16 @@ class Recent:
             "icon": self.icon,
             "option": self.option,
         }
+
+
+def _recent(uri: str, kind: str, label: str | None = None) -> Recent:
+    """Build a Recent from a URI and a kind in `_OPTION_BY_KIND`."""
+    return Recent(
+        uri=uri,
+        label=label or uri.rsplit("/", 1)[-1],
+        icon=kind,
+        option=_OPTION_BY_KIND[kind],
+    )
 
 
 class Code:
@@ -145,7 +167,7 @@ class Code:
             )
         except Exception:
             logger.exception("failed to load recents")
-            return list(self._cache)
+            return self._cache
 
         self._cache = recents
         self._cache_key = cache_key
@@ -241,14 +263,12 @@ class Code:
             except (OSError, json.JSONDecodeError):
                 continue
             if folder := data.get("folder"):
-                uri, icon, option = folder, "folder", "--folder-uri"
+                uri, kind = folder, "folder"
             elif config := data.get("configuration"):
-                uri, icon, option = config, "workspace", "--file-uri"
+                uri, kind = config, "workspace"
             else:
                 continue
-            items.append(
-                (mtime, Recent(uri=uri, label=_pretty_label(uri), icon=icon, option=option))
-            )
+            items.append((mtime, _recent(uri, kind, label=_pretty_label(uri))))
         items.sort(key=lambda pair: pair[0], reverse=True)
         return [recent for _, recent in items]
 
@@ -258,16 +278,15 @@ class Code:
         for entry in entries:
             match entry:
                 case {"folderUri": str(uri)}:
-                    icon, option = "folder", "--folder-uri"
+                    kind = "folder"
                 case {"fileUri": str(uri)}:
-                    icon, option = "file", "--file-uri"
+                    kind = "file"
                 case {"workspace": {"configPath": str(uri)}}:
-                    icon, option = "workspace", "--file-uri"
+                    kind = "workspace"
                 case _:
                     logger.warning("unrecognized entry: %s", entry)
                     continue
-            label = entry.get("label") or uri.rsplit("/", 1)[-1]
-            recents.append(Recent(uri=uri, label=label, icon=icon, option=option))
+            recents.append(_recent(uri, kind, label=entry.get("label")))
         return recents
 
     @staticmethod
@@ -278,36 +297,30 @@ class Code:
         but keeps a recents-ordered cache here so the menu can render before
         the workbench finishes loading.
         """
+        recents: list[Recent] = []
+        for item in Code._find_recent_submenu(storage):
+            kind = _MENU_ID_TO_KIND.get(item.get("id", ""))
+            if kind is None:
+                continue
+            uri_obj = item.get("uri") or {}
+            uri = uri_obj.get("external") or uri_obj.get("path")
+            if not uri:
+                continue
+            recents.append(_recent(uri, kind, label=item.get("label")))
+        return recents
+
+    @staticmethod
+    def _find_recent_submenu(storage: dict[str, Any]) -> list[dict[str, Any]]:
         file_menu = (
             storage.get("lastKnownMenubarData", {})
             .get("menus", {})
             .get("File", {})
             .get("items", [])
         )
-        submenu: list[dict[str, Any]] = []
         for item in file_menu:
             if item.get("id") == RECENT_MENU_ID:
-                submenu = item.get("submenu", {}).get("items", [])
-                break
-
-        recents: list[Recent] = []
-        for item in submenu:
-            match item.get("id"):
-                case "openRecentFolder":
-                    icon, option = "folder", "--folder-uri"
-                case "openRecentFile":
-                    icon, option = "file", "--file-uri"
-                case "openRecentWorkspace":
-                    icon, option = "workspace", "--file-uri"
-                case _:
-                    continue
-            uri_obj = item.get("uri") or {}
-            uri = uri_obj.get("external") or uri_obj.get("path")
-            if not uri:
-                continue
-            label = item.get("label") or uri.rsplit("/", 1)[-1]
-            recents.append(Recent(uri=uri, label=label, icon=icon, option=option))
-        return recents
+                return item.get("submenu", {}).get("items", [])
+        return []
 
     def open_vscode(self, recent: dict[str, str], excluded_env_vars: str | None) -> None:
         if self.installed_path is None:
@@ -319,14 +332,17 @@ class Code:
                 if var:
                     env.pop(var, None)
 
-        cmd: list[str] = [str(self.installed_path)]
-        if option := recent.get("option"):
-            cmd.append(option)
         uri = recent.get("uri", "").strip()
         if not uri:
             logger.error("cannot open VS Code: empty URI")
             return
-        cmd.append(uri)
+        cmd: list[str] = [str(self.installed_path)]
+        if option := recent.get("option"):
+            cmd.extend((option, uri))
+        else:
+            # No --file-uri/--folder-uri to consume the value, so guard with `--`
+            # in case the user typed something starting with a dash.
+            cmd.extend(("--", uri))
 
         try:
             subprocess.Popen(  # noqa: S603 - command is a fixed binary path + sanitized args
@@ -371,38 +387,29 @@ class CodeExtension(Extension):
             return items
 
         if not query_raw:
-            for recent in recents[:MAX_RESULTS]:
-                items.append(self._make_result(recent))
+            items.extend(self._make_result(r) for r in recents[:MAX_RESULTS])
             return items
 
         items.extend(self._fuzzy_match(query_raw, recents))
         return items
 
     def _fuzzy_match(self, query: str, recents: list[Recent]) -> list[ExtensionResultItem]:
-        label_choices = {i: r.label for i, r in enumerate(recents)}
-        uri_choices = {i: r.uri for i, r in enumerate(recents)}
-        label_matches = process.extract(
-            query,
-            label_choices,
-            scorer=fuzz.partial_ratio,
-            processor=utils.default_process,
-            limit=MAX_RESULTS,
-        )
-        uri_matches = process.extract(
-            query,
-            uri_choices,
-            scorer=fuzz.partial_ratio,
-            processor=utils.default_process,
-            limit=MAX_RESULTS,
-        )
+        labels = [r.label for r in recents]
+        uris = [r.uri for r in recents]
 
         seen: set[int] = set()
         results: list[ExtensionResultItem] = []
-        for matches, threshold in (
-            (label_matches, LABEL_MATCH_THRESHOLD),
-            (uri_matches, URI_MATCH_THRESHOLD),
+        for choices, threshold in (
+            (labels, LABEL_MATCH_THRESHOLD),
+            (uris, URI_MATCH_THRESHOLD),
         ):
-            for _, score, idx in matches:
+            for _, score, idx in process.extract(
+                query,
+                choices,
+                scorer=fuzz.partial_ratio,
+                processor=utils.default_process,
+                limit=MAX_RESULTS,
+            ):
                 if score < threshold or idx in seen:
                     continue
                 seen.add(idx)
