@@ -264,7 +264,10 @@ class Code:
                 continue
             if folder := data.get("folder"):
                 uri, kind = folder, "folder"
+            elif workspace := data.get("workspace"):
+                uri, kind = workspace, "workspace"
             elif config := data.get("configuration"):
+                # Older VS Code builds used `configuration` here.
                 uri, kind = config, "workspace"
             else:
                 continue

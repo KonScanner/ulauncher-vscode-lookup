@@ -289,6 +289,19 @@ def test_load_workspace_storage_handles_multiroot_workspace(code_module, tmp_pat
     assert recents[0].uri == "file:///home/u/proj.code-workspace"
 
 
+def test_load_workspace_storage_handles_current_workspace_key(code_module, tmp_path):
+    d = tmp_path / "ws"
+    d.mkdir()
+    (d / "workspace.json").write_text(
+        json.dumps({"workspace": "file:///home/u/current.code-workspace"})
+    )
+    recents = code_module.Code._load_workspace_storage(tmp_path)
+    assert len(recents) == 1
+    assert recents[0].icon == "workspace"
+    assert recents[0].option == "--file-uri"
+    assert recents[0].uri == "file:///home/u/current.code-workspace"
+
+
 def test_load_workspace_storage_skips_dirs_without_workspace_json(code_module, tmp_path):
     (tmp_path / "stray").mkdir()
     _make_workspace_dir(tmp_path, "ok", "file:///home/u/x", mtime=100)
